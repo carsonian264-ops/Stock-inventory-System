@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stock Ledger</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+    <div id="welcomeScreen">
+        <div class="welcome-card">
+            <div class="welcome-corner tl"></div>
+            <div class="welcome-corner tr"></div>
+            <div class="welcome-corner bl"></div>
+            <div class="welcome-corner br"></div>
+            <div class="welcome-badge">📒</div>
+            <div class="welcome-title">Stock Inventory System</div>
+            <div class="welcome-sub">Track &middot; Record &middot; Reconcile</div>
+            <div class="welcome-divider"></div>
+            <button class="welcome-enter-btn" onclick="enterSystem()">
+                Enter System
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 12h14M12 5l7 7-7 7" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <div class="ledger-app no-print" id="app" style="display:none;">
+        <div class="perf"></div>
+        <div class="header">
+            <div>
+                <h1>Stock Ledger</h1>
+                <div class="sub" id="dateLabel">—</div>
+            </div>
+            <div class="header-right">
+                <button class="dark-toggle" id="darkToggle" onclick="toggleDarkMode()">🌙 Dark</button>
+                <div class="date-stamp" id="statusStamp">RECORDS CURRENT</div>
+            </div>
+        </div>
+
+        <div class="tab-bar">
+            <button class="tab-btn active" id="tabLedgerBtn" onclick="showTab('ledger')">📒 Ledger</button>
+            <button class="tab-btn" id="tabReportsBtn" onclick="showTab('reports')">📊 Reports</button>
+        </div>
+
+        <div id="ledgerTab">
+            <div class="ledger-meta-bar">
+                <div class="meta-field">
+                    <label for="bartenderName">Name Of Bartender</label>
+                    <input type="text" id="bartenderName" placeholder="Enter name"
+                        onchange="updateMeta('bartender', this.value)">
+                </div>
+                <div class="meta-field meta-center">
+                    <label for="ledgerDate">Date</label>
+                    <input type="date" id="ledgerDate" onchange="updateMeta('date', this.value)">
+                </div>
+                <div class="meta-field"></div>
+            </div>
+            <div class="summary-row" id="summaryRow"></div>
+
+            <div class="toolbar">
+                <input type="text" id="searchBox" placeholder="Search by brand…" oninput="render()">
+                <button class="btn ghost" onclick="openPOModal()">📋 Purchase Order</button>
+                <button class="btn ghost" onclick="printLedger()">🖨 Print Ledger</button>
+                <button class="btn ghost" onclick="exportCSV()">📊 Export CSV</button>
+                <button class="btn ghost" onclick="saveBackup()">💾 Save Backup</button>
+                <button class="btn ghost" onclick="triggerLoadBackup()">📂 Load Backup</button>
+                <input type="file" id="backupFileInput" accept=".json" style="display:none"
+                    onchange="handleBackupFile(event)">
+                <button class="btn" onclick="closeAllDays()">Close Day &amp; Carry Forward</button>
+            </div>
+
+            <div class="ledger-wrap">
+                <div class="margin-line"></div>
+                <div id="storageWarning" class="storage-warning" style="display:none"></div>
+                <div id="saveWarning" class="storage-warning" style="display:none"></div>
+                <div class="table-scroll">
+                    <div id="tableHost">
+                        <div
+                            style="padding:40px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">
+                            Loading your stock ledger…
+                        </div>
+                    </div>
+                </div>
+                <div class="below-table">
+                    <button class="btn ghost" onclick="addRow()">+ Add Row</button>
+                    <span id="rowCountLabel"
+                        style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);"></span>
+                </div>
+            </div>
+            <div class="foot-note">Total Stock = Opening + New Stock &nbsp;·&nbsp; Closing Stock = Total Stock − Sales
+                Stock &nbsp;·&nbsp; Totals = Sales Stock × Price. "Close Day" carries Closing Stock into tomorrow's
+                Opening Stock and logs the entry to Reports.</div>
+        </div>
+
+        <div id="reportsTab" style="display:none;">
+            <div class="rpt-filter-bar">
+                <label style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">View
+                    by:</label>
+                <select id="rptViewSelect" onchange="toggleReportViewMode()">
+                    <option value="all">All Time</option>
+                    <option value="month">By Month</option>
+                </select>
+                <div id="rptMonthWrap" style="display:none;align-items:center;gap:8px;">
+                    <label
+                        style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">Month:</label>
+                    <input type="month" id="rptMonthInput" onchange="renderReports()">
+                </div>
+                <div style="flex:1;"></div>
+                <button class="btn ghost" onclick="exportHistoryCSV()">📊 Export History CSV</button>
+            </div>
+            <div class="summary-row" id="rptSummaryRow"></div>
+            <div class="ledger-wrap">
+                <div class="margin-line"></div>
+                <div class="table-scroll">
+                    <div id="rptTableHost"></div>
+                </div>
+            </div>
+            <div class="foot-note">Every time you use "Close Day" on the Ledger tab, an entry is logged here — one row
+                per brand, per close. Use this to track sales trends over time.</div>
+        </div>
+    </div>
+
+    <!-- Purchase Order Modal -->
+    <div class="modal-overlay no-print" id="poModal">
+        <div class="modal-box">
+            <div class="modal-title">📋 Purchase Order</div>
+            <div class="modal-sub">Brands currently out of stock. Enter quantities to reorder, then print.</div>
+            <div class="table-scroll" style="max-height:340px;overflow-y:auto;">
+                <div id="poTableHost"></div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closePOModal()">Close</button>
+                <button class="btn" onclick="printPurchaseOrder()">🖨 Print Purchase Order</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Restore Confirmation Modal -->
+    <div class="modal-overlay no-print" id="restoreConfirmModal">
+        <div class="modal-box" style="max-width:460px;">
+            <div class="modal-title">⚠️ Replace Current Ledger?</div>
+            <div class="modal-sub">Restoring this backup will replace everything currently in your ledger and history.
+                This can't be undone unless you have another backup.</div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="cancelRestore()">Cancel</button>
+                <button class="btn" onclick="confirmRestore()">Yes, Restore Backup</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="print-only" id="poPrintArea"></div>
+    <div class="print-only" id="ledgerPrintArea"></div>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
