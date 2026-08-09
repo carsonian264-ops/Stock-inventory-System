@@ -16,7 +16,7 @@
     }
 
     let storageOK = true;
-    let saveFailed = false;
+    let failedSaveKeys = new Set();
     let meta = { bartender: '', date: '' };
 
     async function saveWithRetry(key, value, retries = 3, baseDelayMs = 600) {
@@ -74,6 +74,8 @@
         throw lastErr;
     }
 
+    let metaLoaded = false;
+
     async function loadMeta() {
         try {
             const res = await loadWithRetry('stock_meta');
@@ -91,16 +93,20 @@
         const dateEl = document.getElementById('ledgerDate');
         if (nameEl) nameEl.value = meta.bartender;
         if (dateEl) dateEl.value = meta.date;
+        metaLoaded = true;
     }
 
     async function saveMeta() {
-        await saveWithRetry('stock_meta', JSON.stringify(meta));
+        const ok = await saveWithRetry('stock_meta', JSON.stringify(meta));
+        if (ok) { failedSaveKeys.delete('stock_meta'); } else { failedSaveKeys.add('stock_meta'); }
+        updateSaveBanner();
+        return ok;
     }
 
-    window.updateMeta = function (field, value) {
+    window.updateMeta = async function (field, value) {
         meta[field] = value;
-        saveMeta();
-        flashStatus('SAVED ' + new Date().toLocaleTimeString());
+        const ok = await saveMeta();
+        flashStatus(ok ? ('SAVED ' + new Date().toLocaleTimeString()) : 'SAVE FAILED — SEE BANNER', !ok);
     };
 
     async function loadRows() {
@@ -125,7 +131,7 @@
             return;
         }
         const ok = await saveWithRetry('stock_rows', JSON.stringify(rows));
-        saveFailed = !ok;
+        if (ok) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
         updateSaveBanner();
         flashStatus(ok ? ('SAVED ' + new Date().toLocaleTimeString()) : 'SAVE FAILED — SEE BANNER', !ok);
     }
@@ -133,10 +139,12 @@
     function updateSaveBanner() {
         const el = document.getElementById('saveWarning');
         if (!el) return;
-        if (saveFailed) {
+        if (failedSaveKeys.size > 0) {
+            const labels = { stock_rows: 'the ledger table', stock_meta: 'the bartender name / date', stock_daily_tables: 'the day-close archive', stock_history: 'the sales history' };
+            const what = [...failedSaveKeys].map(k => labels[k] || k).join(', ');
             el.style.display = 'block';
             el.innerHTML = `
-          <strong>Your last change didn't save.</strong><br>
+          <strong>Your last change to ${what} didn't save.</strong><br>
           The storage service returned an error after several attempts. Your edits are still here in this
           tab — please don't close it. If retrying keeps failing, use <strong>💾 Save Backup</strong> in the
           toolbar now to download a copy to your device, so nothing is lost even if this page closes.
@@ -151,7 +159,8 @@
 
     window.retrySave = async function () {
         flashStatus('RETRYING SAVE…');
-        await saveRows();
+        if (failedSaveKeys.has('stock_rows')) await saveRows();
+        if (failedSaveKeys.has('stock_meta')) await saveMeta();
     };
 
     async function getHistory() {
@@ -164,16 +173,37 @@
         }
     }
 
+    async function getDailyTables() {
+        try {
+            const res = await loadWithRetry('stock_daily_tables');
+            return { ok: true, data: res ? JSON.parse(res.value) : [] };
+        } catch (e) {
+            console.error('Daily tables read failed after retries', e);
+            return { ok: false, data: [] };
+        }
+    }
+
+    async function saveDailyTables(list) {
+        return await saveWithRetry('stock_daily_tables', JSON.stringify(list));
+    }
+
     async function appendHistory(entry) {
         const { ok, data: hist } = await getHistory();
+        let list = hist;
         if (!ok) {
-            // Do NOT save here: we couldn't confirm existing history, so saving now
-            // would overwrite it with just this one entry. Abort and say so plainly.
-            flashStatus('DAY CLOSED, BUT NOT LOGGED — COULD NOT READ HISTORY', true);
-            return;
+            const proceed = confirm(
+                "Couldn't confirm your existing sales history — this may just mean nothing's been logged yet, or it could " +
+                "be a temporary connection issue. Continuing will start the history log fresh; if you've logged entries " +
+                "before, this could erase them. Continue anyway?"
+            );
+            if (!proceed) {
+                flashStatus('DAY CLOSED, BUT NOT LOGGED — HISTORY NOT CONFIRMED', true);
+                return;
+            }
+            list = [];
         }
-        hist.push(entry);
-        const saved = await saveWithRetry('stock_history', JSON.stringify(hist));
+        list.push(entry);
+        const saved = await saveWithRetry('stock_history', JSON.stringify(list));
         if (!saved) { flashStatus('HISTORY SAVE FAILED', true); }
     }
 
@@ -425,22 +455,103 @@
         flashStatus('DAY CLOSED — ' + (r.brand || 'row'));
     };
 
+    let pendingCloseDayDate = null;
+
     window.closeAllDays = async function () {
         if (rows.length === 0) return;
+        await attemptCloseDay(false);
+    };
+
+    window.retryCloseDay = async function () {
+        document.getElementById('archiveFailModal').classList.remove('show');
+        await attemptCloseDay(false);
+    };
+
+    window.proceedCloseDayAnyway = async function () {
+        document.getElementById('archiveFailModal').classList.remove('show');
+        await attemptCloseDay(true);
+    };
+
+    window.cancelCloseDay = function () {
+        document.getElementById('archiveFailModal').classList.remove('show');
+    };
+
+    async function attemptCloseDay(skipArchiveConfirmation) {
+        // Archive today's full table as a snapshot before touching it — this is what
+        // "View Past Day" reads from. Gated the same cautious way as everything else
+        // that writes: if we can't confirm what's already archived, don't silently
+        // overwrite it — offer a clear, explicit choice instead of just blocking.
+        const archiveDate = (meta.date && meta.date.trim()) || new Date().toISOString().slice(0, 10);
+        let dailyTables;
+        if (skipArchiveConfirmation) {
+            dailyTables = [];
+        } else {
+            const { ok: archiveReadOk, data } = await getDailyTables();
+            if (!archiveReadOk) {
+                pendingCloseDayDate = archiveDate;
+                document.getElementById('archiveFailModal').classList.add('show');
+                return;
+            }
+            dailyTables = data;
+        }
+
+        const snapshot = {
+            date: archiveDate,
+            bartender: meta.bartender || '',
+            rows: JSON.parse(JSON.stringify(rows)),
+            closedAt: new Date().toISOString()
+        };
+        const updatedTables = dailyTables.filter(t => t.date !== archiveDate);
+        updatedTables.push(snapshot);
+        const archiveSaved = await saveDailyTables(updatedTables);
+        if (!archiveSaved) {
+            flashStatus('DAY NOT CLOSED — ARCHIVE SAVE FAILED', true);
+            return;
+        }
+
+        // Log each row to the sales-history trend log, then carry stock forward.
+        // Batched into one read/write for the whole action (not per row) so a read
+        // failure only ever asks once, instead of once per row in the table.
+        const { ok: histReadOk, data: histData } = await getHistory();
+        let hist = histReadOk ? histData : null;
+        if (!histReadOk) {
+            const proceed = confirm(
+                "Couldn't confirm your existing sales history — this may just mean nothing's been logged yet, or it could " +
+                "be a temporary connection issue. Continuing will start the history log fresh; if you've logged entries " +
+                "before, this could erase them.\n\nContinue logging history for this close? (Choosing Cancel still closes " +
+                "the day and moves stock forward — it just skips the history log entry this time.)"
+            );
+            hist = proceed ? [] : null;
+        }
         for (const r of rows) {
             const closing = closingOf(r);
-            await appendHistory({
-                rowId: r.id, brand: r.brand, date: new Date().toISOString(),
-                opening: r.opening, newStock: r.newStock, sales: r.sales, closing,
-                price: r.price, totals: totalsOf(r)
-            });
+            if (hist !== null) {
+                hist.push({
+                    rowId: r.id, brand: r.brand, date: new Date().toISOString(),
+                    opening: r.opening, newStock: r.newStock, sales: r.sales, closing,
+                    price: r.price, totals: totalsOf(r)
+                });
+            }
             r.opening = closing;
             r.newStock = 0;
             r.sales = 0;
         }
+        if (hist !== null) {
+            const histSaved = await saveWithRetry('stock_history', JSON.stringify(hist));
+            if (!histSaved) { flashStatus('HISTORY SAVE FAILED', true); }
+        }
+
+        // Advance the working date to the next day, ready for the new table.
+        const nextDate = new Date(archiveDate + 'T00:00:00');
+        nextDate.setDate(nextDate.getDate() + 1);
+        meta.date = nextDate.toISOString().slice(0, 10);
+        const dateEl = document.getElementById('ledgerDate');
+        if (dateEl) dateEl.value = meta.date;
+        saveMeta();
+
         saveRows();
         render();
-        flashStatus('DAY CLOSED — ALL ROWS');
+        flashStatus(`${archiveDate} ARCHIVED — NEW TABLE STARTED FOR ${meta.date}`);
     };
 
     window.exportCSV = function () {
@@ -523,6 +634,89 @@
     window.closePOModal = function () {
         document.getElementById('poModal').classList.remove('show');
     };
+
+    // ---------- VIEW PAST DAY ----------
+    window.openPastDayModal = function () {
+        document.getElementById('pastDayTableHost').innerHTML = `<div style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">Pick a date above and click Load.</div>`;
+        document.getElementById('pastDayModal').classList.add('show');
+    };
+
+    window.closePastDayModal = function () {
+        document.getElementById('pastDayModal').classList.remove('show');
+    };
+
+    window.loadPastDay = async function () {
+        const dateVal = document.getElementById('pastDayInput').value;
+        const host = document.getElementById('pastDayTableHost');
+        if (!dateVal) {
+            host.innerHTML = `<div style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">Pick a date first.</div>`;
+            return;
+        }
+        host.innerHTML = `<div style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">Loading…</div>`;
+        const { ok, data: dailyTables } = await getDailyTables();
+        if (!ok) {
+            host.innerHTML = `
+          <div class="storage-warning" style="display:block;margin:0;">
+            <strong>Couldn't load past tables right now.</strong><br>
+            This looks like a temporary connection issue.
+            <div class="storage-warning-actions">
+              <button class="btn" onclick="loadPastDay()">Retry</button>
+            </div>
+          </div>`;
+            return;
+        }
+        const match = dailyTables.find(t => t.date === dateVal);
+        if (!match) {
+            host.innerHTML = `<div style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">No archived table found for ${dateVal}. A table gets archived automatically when you click "Close Day &amp; Carry Forward" on that date.</div>`;
+            return;
+        }
+        const withBrand = match.rows.filter(r => r.brand && r.brand.trim() !== '');
+        if (withBrand.length === 0) {
+            host.innerHTML = `<div style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">That day's table has no brands recorded.</div>`;
+            return;
+        }
+        const bodyRows = withBrand.map((r, i) => {
+            const total = (Number(r.opening) || 0) + (Number(r.newStock) || 0);
+            const closing = total - (Number(r.sales) || 0);
+            const totals = (Number(r.sales) || 0) * (Number(r.price) || 0);
+            const status = closing <= 0 ? 'Out of Stock' : 'In Stock';
+            return `
+          <tr>
+            <td style="padding:8px;">${i + 1}</td>
+            <td style="padding:8px;font-weight:600;">${escapeHtml(r.brand)}</td>
+            <td class="num" style="padding:8px;">${r.opening}</td>
+            <td class="num" style="padding:8px;">${r.newStock}</td>
+            <td class="num" style="padding:8px;">${total}</td>
+            <td class="num" style="padding:8px;">${closing}</td>
+            <td class="num" style="padding:8px;">${r.sales}</td>
+            <td class="num" style="padding:8px;">${money(r.price)}</td>
+            <td class="num" style="padding:8px;">${money(totals)}</td>
+            <td class="center" style="padding:8px;">${status}</td>
+          </tr>`;
+        }).join('');
+        host.innerHTML = `
+        <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);margin-bottom:8px;">
+          Bartender: <strong style="color:var(--ink);">${escapeHtml(match.bartender || '—')}</strong>
+          &nbsp;·&nbsp; Closed: ${new Date(match.closedAt).toLocaleString()}
+        </div>
+        <table style="width:100%;border-collapse:collapse;font-family:'IBM Plex Mono',monospace;font-size:12px;">
+          <thead><tr style="background:var(--navy);color:var(--cream-white);">
+            <th style="text-align:left;padding:8px;">No.</th>
+            <th style="text-align:left;padding:8px;">Brand</th>
+            <th style="text-align:right;padding:8px;">Opening</th>
+            <th style="text-align:right;padding:8px;">New</th>
+            <th style="text-align:right;padding:8px;">Total</th>
+            <th style="text-align:right;padding:8px;">Closing</th>
+            <th style="text-align:right;padding:8px;">Sales</th>
+            <th style="text-align:right;padding:8px;">Price</th>
+            <th style="text-align:right;padding:8px;">Totals</th>
+            <th style="text-align:center;padding:8px;">Status</th>
+          </tr></thead>
+          <tbody>${bodyRows}</tbody>
+        </table>
+      `;
+    };
+
     window.printPurchaseOrder = function () {
         const list = rows.filter(r => r.brand && r.brand.trim() !== '' && closingOf(r) <= 0);
         if (list.length === 0) return;
@@ -661,12 +855,19 @@
         if (!pendingRestoreData) return;
         rows = pendingRestoreData.rows;
         const hist = Array.isArray(pendingRestoreData.history) ? pendingRestoreData.history : [];
-        await saveWithRetry('stock_rows', JSON.stringify(rows));
-        await saveWithRetry('stock_history', JSON.stringify(hist));
+        const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows));
+        const histOk = await saveWithRetry('stock_history', JSON.stringify(hist));
+        if (rowsOk) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
+        if (histOk) { failedSaveKeys.delete('stock_history'); } else { failedSaveKeys.add('stock_history'); }
+        updateSaveBanner();
         pendingRestoreData = null;
         document.getElementById('restoreConfirmModal').classList.remove('show');
         render();
-        flashStatus('BACKUP RESTORED');
+        if (rowsOk && histOk) {
+            flashStatus('BACKUP RESTORED');
+        } else {
+            flashStatus('RESTORE INCOMPLETE — SEE BANNER', true);
+        }
     };
 
     // ---------- REPORTS ----------
@@ -752,11 +953,136 @@
     document.getElementById('searchBox').addEventListener('keydown', e => { if (e.key === 'Enter') e.preventDefault(); });
 
     window.addEventListener('beforeunload', function (e) {
-        if (saveFailed) {
+        if (failedSaveKeys.size > 0) {
             e.preventDefault();
             e.returnValue = '';
         }
     });
+
+    // ---------- LOGIN GATE ----------
+    // NOTE: this is a soft access screen only. Credentials live in plain JSON in
+    // the same storage as everything else in this file — there is no encryption
+    // and no server-side check. It's meant to personalize entry and discourage
+    // casual access, not to provide real security.
+    let loginCreds = null;
+
+    async function loadLoginCreds() {
+        try {
+            const res = await loadWithRetry('stock_login');
+            const parsed = res ? JSON.parse(res.value) : null;
+            loginCreds = (parsed && typeof parsed === 'object' && parsed.username) ? parsed : null;
+        } catch (e) {
+            console.warn('Login state read failed, defaulting to setup screen', e);
+            loginCreds = null;
+        }
+        renderLoginForm();
+    }
+
+    function renderLoginForm() {
+        const area = document.getElementById('loginFormArea');
+        if (!area) return;
+        if (!loginCreds) {
+            area.innerHTML = `
+          <div class="login-form">
+            <label class="login-label" for="loginSetupUser">Choose a username</label>
+            <input class="login-input" type="text" id="loginSetupUser" placeholder="e.g. your name" autocomplete="off">
+            <label class="login-label" for="loginSetupPass">Choose a password</label>
+            <input class="login-input" type="password" id="loginSetupPass" placeholder="Anything you'll remember" autocomplete="new-password" onkeydown="if(event.key==='Enter'){event.preventDefault();createLogin();}">
+            <div id="loginError" class="login-error" style="display:none;"></div>
+            <button class="login-submit-btn" onclick="createLogin()">
+              Create Login &amp; Enter
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </button>
+          </div>
+        `;
+        } else {
+            area.innerHTML = `
+          <div class="login-form">
+            <div class="welcome-returning">Welcome back, <strong>${escapeHtml(loginCreds.username)}</strong></div>
+            <label class="login-label" for="loginPass">Password</label>
+            <input class="login-input" type="password" id="loginPass" placeholder="Enter your password" autocomplete="current-password" onkeydown="if(event.key==='Enter'){event.preventDefault();attemptLogin();}">
+            <div id="loginError" class="login-error" style="display:none;"></div>
+            <button class="login-submit-btn" onclick="attemptLogin()">
+              Sign In
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
+            </button>
+            <button class="login-link-btn" onclick="showResetConfirm()">Not you, or forgot your password? Reset login</button>
+          </div>
+        `;
+            setTimeout(() => { const p = document.getElementById('loginPass'); if (p) p.focus(); }, 0);
+        }
+    }
+
+    window.createLogin = async function () {
+        const userEl = document.getElementById('loginSetupUser');
+        const passEl = document.getElementById('loginSetupPass');
+        const errEl = document.getElementById('loginError');
+        const username = (userEl.value || '').trim();
+        const password = passEl.value || '';
+        if (!username || !password) {
+            errEl.textContent = 'Please choose both a username and a password.';
+            errEl.style.display = 'block';
+            return;
+        }
+        const newCreds = { username, password };
+        const ok = await saveWithRetry('stock_login', JSON.stringify(newCreds));
+        if (!ok) {
+            errEl.textContent = "Couldn't save your login right now — please try again.";
+            errEl.style.display = 'block';
+            return;
+        }
+        loginCreds = newCreds;
+        afterLoginSuccess(username);
+    };
+
+    window.attemptLogin = function () {
+        const passEl = document.getElementById('loginPass');
+        const errEl = document.getElementById('loginError');
+        const entered = passEl.value || '';
+        if (!loginCreds || entered !== loginCreds.password) {
+            errEl.textContent = 'Incorrect password. Please try again.';
+            errEl.style.display = 'block';
+            passEl.value = '';
+            passEl.focus();
+            return;
+        }
+        afterLoginSuccess(loginCreds.username);
+    };
+
+    function afterLoginSuccess(username) {
+        // Nice-to-have: prefill the bartender name if it hasn't been set yet.
+        // Guarded by metaLoaded so this can never race ahead of the real saved value.
+        if (metaLoaded && (!meta.bartender || !meta.bartender.trim())) {
+            meta.bartender = username;
+            const nameEl = document.getElementById('bartenderName');
+            if (nameEl) nameEl.value = username;
+            saveMeta();
+        }
+        const navUserEl = document.getElementById('navUser');
+        if (navUserEl) navUserEl.innerHTML = `Logged in as <strong>${escapeHtml(username)}</strong>`;
+        enterSystem();
+    }
+
+    window.doLogout = function () {
+        if (!confirm("Log out? You'll need to enter the password again to get back in.")) return;
+        document.getElementById('app').style.display = 'none';
+        document.getElementById('welcomeScreen').classList.remove('hidden');
+        renderLoginForm();
+    };
+
+    window.showResetConfirm = function () {
+        if (!confirm('Reset the login for this file? Anyone who opens it afterward will be able to set new credentials — only do this if you forgot yours.')) return;
+        resetLogin();
+    };
+
+    async function resetLogin() {
+        loginCreds = null;
+        const ok = await saveWithRetry('stock_login', JSON.stringify(null));
+        if (!ok) {
+            alert("The reset didn't fully save due to a storage error — if you reopen this file before it resolves, your old login may still be there. Try again in a moment.");
+        }
+        renderLoginForm();
+    }
 
     window.enterSystem = function () {
         const welcome = document.getElementById('welcomeScreen');
@@ -773,7 +1099,14 @@
         // fresh page load can see every single read fail at once.
         await new Promise(r => setTimeout(r, 250));
 
-        // Load the stock rows first, alone — this is the data that matters most,
+        // Login form first — it's the very first thing the user sees.
+        await loadLoginCreds().catch(function (e) {
+            console.error('Login state load crashed unexpectedly', e);
+            loginCreds = null;
+            renderLoginForm();
+        });
+
+        // Load the stock rows next — this is the data that matters most,
         // and it renders the table (or the retry banner) as soon as it resolves.
         await loadRows().catch(function (e) {
             console.error('Loading crashed unexpectedly', e);
