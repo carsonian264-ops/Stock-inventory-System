@@ -23,13 +23,12 @@
             <div class="welcome-title">Stock Inventory System</div>
             <div class="welcome-sub">Track &middot; Record &middot; Reconcile</div>
             <div class="welcome-divider"></div>
-            <button class="welcome-enter-btn" onclick="enterSystem()">
-                Enter System
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
-                    stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M5 12h14M12 5l7 7-7 7" />
-                </svg>
-            </button>
+            <div id="loginFormArea">
+                <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(244,245,239,.5);">Loading…
+                </div>
+            </div>
+            <div class="welcome-note">This login is a simple access screen for this device — it isn't secure
+                authentication, and credentials aren't encrypted. Don't reuse a password you use elsewhere.</div>
         </div>
     </div>
 
@@ -41,7 +40,9 @@
                 <div class="sub" id="dateLabel">—</div>
             </div>
             <div class="header-right">
+                <span class="nav-user" id="navUser"></span>
                 <button class="dark-toggle" id="darkToggle" onclick="toggleDarkMode()">🌙 Dark</button>
+                <button class="dark-toggle" onclick="doLogout()">Logout</button>
                 <div class="date-stamp" id="statusStamp">RECORDS CURRENT</div>
             </div>
         </div>
@@ -69,6 +70,7 @@
             <div class="toolbar">
                 <input type="text" id="searchBox" placeholder="Search by brand…" oninput="render()">
                 <button class="btn ghost" onclick="openPOModal()">📋 Purchase Order</button>
+                <button class="btn ghost" onclick="openPastDayModal()">🕘 View Past Day</button>
                 <button class="btn ghost" onclick="printLedger()">🖨 Print Ledger</button>
                 <button class="btn ghost" onclick="exportCSV()">📊 Export CSV</button>
                 <button class="btn ghost" onclick="saveBackup()">💾 Save Backup</button>
@@ -140,6 +142,52 @@
             <div class="modal-actions">
                 <button class="btn ghost" onclick="closePOModal()">Close</button>
                 <button class="btn" onclick="printPurchaseOrder()">🖨 Print Purchase Order</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- View Past Day Modal -->
+    <div class="modal-overlay no-print" id="pastDayModal">
+        <div class="modal-box" style="max-width:760px;">
+            <div class="modal-title">🕘 View a Past Day's Table</div>
+            <div class="modal-sub">Pick a date to see that day's ledger exactly as it stood when it was closed. This is
+                read-only — it won't affect today's table.</div>
+            <div style="display:flex;gap:10px;align-items:center;margin-bottom:14px;flex-wrap:wrap;">
+                <input type="date" id="pastDayInput" class="cell-input" style="width:auto;">
+                <button class="btn" onclick="loadPastDay()">Load</button>
+            </div>
+            <div class="table-scroll" style="max-height:380px;overflow-y:auto;">
+                <div id="pastDayTableHost">
+                    <div
+                        style="padding:20px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">
+                        Pick a date above and click Load.</div>
+                </div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closePastDayModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Archive Confirmation Failure Modal -->
+    <div class="modal-overlay no-print" id="archiveFailModal">
+        <div class="modal-box" style="max-width:480px;">
+            <div class="modal-title">⚠️ Couldn't Confirm Past Tables</div>
+            <div class="modal-sub">
+                We couldn't read your previously archived daily tables, so closing the day was paused rather than risk
+                overwriting them. This usually means one of two things:
+                <br><br>
+                • <strong>This is genuinely your first time</strong> closing a day — nothing's archived yet, so
+                continuing is safe.
+                <br>
+                • <strong>You've closed days before</strong> and this is a temporary connection issue — if so,
+                continuing would
+                erase those earlier archives. If you're not sure which applies, choose Retry.
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="cancelCloseDay()">Cancel</button>
+                <button class="btn ghost" onclick="retryCloseDay()">Retry</button>
+                <button class="btn" onclick="proceedCloseDayAnyway()">This is my first time — Continue</button>
             </div>
         </div>
     </div>
