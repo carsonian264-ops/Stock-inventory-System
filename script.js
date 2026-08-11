@@ -17,13 +17,14 @@
 
     let storageOK = true;
     let failedSaveKeys = new Set();
+    let teamMode = false;
     let meta = { bartender: '', date: '' };
 
-    async function saveWithRetry(key, value, retries = 3, baseDelayMs = 600) {
+    async function saveWithRetry(key, value, shared = false, retries = 3, baseDelayMs = 600) {
         let lastErr = null;
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                await window.storage.set(key, value);
+                await window.storage.set(key, value, shared);
                 return true;
             } catch (e) {
                 lastErr = e;
@@ -50,11 +51,11 @@
         return msg.includes('not found') || msg.includes('no such key') || msg.includes('does not exist');
     }
 
-    async function loadWithRetry(key, retries = 3, baseDelayMs = 900, timeoutMs = 8000) {
+    async function loadWithRetry(key, shared = false, retries = 3, baseDelayMs = 900, timeoutMs = 8000) {
         let lastErr = null;
         for (let attempt = 1; attempt <= retries; attempt++) {
             try {
-                return await withTimeout(window.storage.get(key), timeoutMs, `Loading "${key}"`);
+                return await withTimeout(window.storage.get(key, shared), timeoutMs, `Loading "${key}"`);
             } catch (e) {
                 lastErr = e;
                 if (looksLikeMissingKey(e)) {
@@ -78,7 +79,7 @@
 
     async function loadMeta() {
         try {
-            const res = await loadWithRetry('stock_meta');
+            const res = await loadWithRetry('stock_meta', teamMode);
             const parsed = res ? JSON.parse(res.value) : null;
             meta = (parsed && typeof parsed === 'object')
                 ? { bartender: parsed.bartender || '', date: parsed.date || '' }
@@ -97,7 +98,7 @@
     }
 
     async function saveMeta() {
-        const ok = await saveWithRetry('stock_meta', JSON.stringify(meta));
+        const ok = await saveWithRetry('stock_meta', JSON.stringify(meta), teamMode);
         if (ok) { failedSaveKeys.delete('stock_meta'); } else { failedSaveKeys.add('stock_meta'); }
         updateSaveBanner();
         return ok;
@@ -111,7 +112,7 @@
 
     async function loadRows() {
         try {
-            const res = await loadWithRetry('stock_rows');
+            const res = await loadWithRetry('stock_rows', teamMode);
             rows = res ? JSON.parse(res.value) : null;
             if (rows === null) {
                 rows = Array.from({ length: ROW_COUNT_DEFAULT }, blankRow);
@@ -130,7 +131,7 @@
             flashStatus('NOT SAVED — RESOLVE STORAGE FIRST', true);
             return;
         }
-        const ok = await saveWithRetry('stock_rows', JSON.stringify(rows));
+        const ok = await saveWithRetry('stock_rows', JSON.stringify(rows), teamMode);
         if (ok) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
         updateSaveBanner();
         flashStatus(ok ? ('SAVED ' + new Date().toLocaleTimeString()) : 'SAVE FAILED — SEE BANNER', !ok);
@@ -165,7 +166,7 @@
 
     async function getHistory() {
         try {
-            const res = await loadWithRetry('stock_history');
+            const res = await loadWithRetry('stock_history', teamMode);
             return { ok: true, data: res ? JSON.parse(res.value) : [] };
         } catch (e) {
             console.error('History read failed after retries', e);
@@ -175,7 +176,7 @@
 
     async function getDailyTables() {
         try {
-            const res = await loadWithRetry('stock_daily_tables');
+            const res = await loadWithRetry('stock_daily_tables', teamMode);
             return { ok: true, data: res ? JSON.parse(res.value) : [] };
         } catch (e) {
             console.error('Daily tables read failed after retries', e);
@@ -184,7 +185,7 @@
     }
 
     async function saveDailyTables(list) {
-        return await saveWithRetry('stock_daily_tables', JSON.stringify(list));
+        return await saveWithRetry('stock_daily_tables', JSON.stringify(list), teamMode);
     }
 
     async function appendHistory(entry) {
@@ -203,7 +204,7 @@
             list = [];
         }
         list.push(entry);
-        const saved = await saveWithRetry('stock_history', JSON.stringify(list));
+        const saved = await saveWithRetry('stock_history', JSON.stringify(list), teamMode);
         if (!saved) { flashStatus('HISTORY SAVE FAILED', true); }
     }
 
@@ -242,6 +243,59 @@
         const nowDark = !app.classList.contains('dark');
         applyTheme(nowDark ? 'dark' : 'light');
         try { await window.storage.set('ui_theme', JSON.stringify(nowDark ? 'dark' : 'light')); } catch (e) { /* non-critical */ }
+    };
+
+    // ---------- TEAM MODE ----------
+    // Personal data (shared:false, the default everywhere else in this app) is only
+    // ever visible to the account that saved it — which is exactly why two people, or
+    // one person on two devices, never see the same table by default. Team Mode is an
+    // explicit, opt-in switch to shared:true storage instead: a single table visible
+    // and editable by anyone who also has Team Mode on for this same file. It's off by
+    // default and never turns on without a clear confirmation, since it's a real change
+    // in who can see your data, not just a display setting.
+    async function initTeamMode() {
+        try {
+            const res = await window.storage.get('ui_team_mode');
+            teamMode = res ? JSON.parse(res.value) === true : false;
+        } catch (e) {
+            teamMode = false;
+        }
+        updateTeamModeUI();
+    }
+
+    function updateTeamModeUI() {
+        const banner = document.getElementById('teamModeBanner');
+        const btn = document.getElementById('teamModeToggleBtn');
+        if (banner) banner.style.display = teamMode ? 'flex' : 'none';
+        if (btn) btn.textContent = teamMode ? '🌐 Team Mode: On' : '🌐 Team Mode: Off';
+    }
+
+    async function reloadForModeSwitch() {
+        loaded = false;
+        metaLoaded = false;
+        await loadRows();
+        await loadMeta();
+    }
+
+    window.toggleTeamMode = async function () {
+        if (teamMode) {
+            if (!confirm('Turn off Team Mode? You will go back to viewing only your own private table — the shared table stays exactly as it is for anyone still using it.')) return;
+            teamMode = false;
+        } else {
+            const proceed = confirm(
+                "Turn on Team Mode?\n\nYour view will switch to a SHARED table — visible and editable by anyone else who " +
+                "also turns Team Mode on for this same file. Your current personal table is not deleted or merged; it's " +
+                "just set aside, and you can turn Team Mode off anytime to go back to it exactly as you left it.\n\n" +
+                "Want to bring your current table INTO the shared one instead of starting fresh? Turn on Team Mode, then " +
+                "use Load Backup or Sync via Code to bring your data in."
+            );
+            if (!proceed) return;
+            teamMode = true;
+        }
+        try { await window.storage.set('ui_team_mode', JSON.stringify(teamMode)); } catch (e) { /* non-critical: this is just a personal display preference */ }
+        updateTeamModeUI();
+        await reloadForModeSwitch();
+        flashStatus(teamMode ? 'TEAM MODE ON — VIEWING SHARED TABLE' : 'TEAM MODE OFF — VIEWING YOUR TABLE');
     };
 
     // ---------- TABS ----------
@@ -537,7 +591,7 @@
             r.sales = 0;
         }
         if (hist !== null) {
-            const histSaved = await saveWithRetry('stock_history', JSON.stringify(hist));
+            const histSaved = await saveWithRetry('stock_history', JSON.stringify(hist), teamMode);
             if (!histSaved) { flashStatus('HISTORY SAVE FAILED', true); }
         }
 
@@ -855,8 +909,8 @@
         if (!pendingRestoreData) return;
         rows = pendingRestoreData.rows;
         const hist = Array.isArray(pendingRestoreData.history) ? pendingRestoreData.history : [];
-        const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows));
-        const histOk = await saveWithRetry('stock_history', JSON.stringify(hist));
+        const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows), teamMode);
+        const histOk = await saveWithRetry('stock_history', JSON.stringify(hist), teamMode);
         if (rowsOk) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
         if (histOk) { failedSaveKeys.delete('stock_history'); } else { failedSaveKeys.add('stock_history'); }
         updateSaveBanner();
@@ -868,6 +922,89 @@
         } else {
             flashStatus('RESTORE INCOMPLETE — SEE BANNER', true);
         }
+    };
+
+    // ---------- SYNC VIA CODE ----------
+    // A lighter-weight alternative to Save/Load Backup for quick device-to-device
+    // transfer: carries just the live table + bartender/date (not history or day
+    // archives) as a copy-pasteable text code, useful where downloading a file is
+    // awkward but pasting text isn't.
+    let pendingSyncData = null;
+
+    window.openSyncModal = function () {
+        document.getElementById('syncCodeOutput').style.display = 'none';
+        document.getElementById('pasteSyncInput').value = '';
+        document.getElementById('syncModal').classList.add('show');
+    };
+
+    window.closeSyncModal = function () {
+        document.getElementById('syncModal').classList.remove('show');
+    };
+
+    window.copySyncCode = async function () {
+        const payload = { rows, meta };
+        const code = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+        const outputEl = document.getElementById('syncCodeOutput');
+        outputEl.style.display = 'block';
+        outputEl.value = code;
+        try {
+            if (!navigator.clipboard || !navigator.clipboard.writeText) throw new Error('Clipboard API unavailable');
+            await navigator.clipboard.writeText(code);
+            flashStatus('SYNC CODE COPIED — PASTE IT ON THE OTHER DEVICE');
+        } catch (e) {
+            flashStatus('COULD NOT AUTO-COPY — SELECT THE CODE BELOW MANUALLY', true);
+            outputEl.focus();
+            outputEl.select();
+        }
+    };
+
+    window.loadSyncCode = function () {
+        const input = document.getElementById('pasteSyncInput');
+        const raw = (input.value || '').trim();
+        if (!raw) return;
+        try {
+            const json = decodeURIComponent(escape(atob(raw)));
+            const payload = JSON.parse(json);
+            if (!payload || !Array.isArray(payload.rows)) {
+                alert("That code doesn't look valid — please check you copied the whole thing.");
+                return;
+            }
+            pendingSyncData = payload;
+            document.getElementById('syncConfirmModal').classList.add('show');
+        } catch (e) {
+            alert("That code doesn't look valid — please check you copied the whole thing.");
+        }
+    };
+
+    window.cancelSyncRestore = function () {
+        pendingSyncData = null;
+        document.getElementById('syncConfirmModal').classList.remove('show');
+    };
+
+    window.confirmSyncRestore = async function () {
+        if (!pendingSyncData) return;
+        rows = pendingSyncData.rows;
+        if (pendingSyncData.meta && typeof pendingSyncData.meta === 'object') {
+            meta = {
+                bartender: pendingSyncData.meta.bartender || '',
+                date: pendingSyncData.meta.date || meta.date
+            };
+            const nameEl = document.getElementById('bartenderName');
+            const dateEl = document.getElementById('ledgerDate');
+            if (nameEl) nameEl.value = meta.bartender;
+            if (dateEl) dateEl.value = meta.date;
+        }
+        const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows), teamMode);
+        const metaOk = await saveWithRetry('stock_meta', JSON.stringify(meta), teamMode);
+        if (rowsOk) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
+        if (metaOk) { failedSaveKeys.delete('stock_meta'); } else { failedSaveKeys.add('stock_meta'); }
+        updateSaveBanner();
+        pendingSyncData = null;
+        document.getElementById('syncConfirmModal').classList.remove('show');
+        document.getElementById('syncModal').classList.remove('show');
+        document.getElementById('pasteSyncInput').value = '';
+        render();
+        flashStatus(rowsOk && metaOk ? 'SYNCED FROM CODE' : 'SYNC INCOMPLETE — SEE BANNER', !(rowsOk && metaOk));
     };
 
     // ---------- REPORTS ----------
@@ -960,11 +1097,24 @@
     });
 
     // ---------- LOGIN GATE ----------
-    // NOTE: this is a soft access screen only. Credentials live in plain JSON in
-    // the same storage as everything else in this file — there is no encryption
-    // and no server-side check. It's meant to personalize entry and discourage
-    // casual access, not to provide real security.
+    // NOTE: this is a soft access screen only. There is no server-side check, so a
+    // determined person could still view the page's source. What this DOES do:
+    // the password itself is never stored — only a salted SHA-256 hash of it — so
+    // a casual glance at storage/source doesn't hand someone the actual password.
     let loginCreds = null;
+
+    function randomSalt() {
+        const arr = new Uint8Array(16);
+        crypto.getRandomValues(arr);
+        return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function hashPassword(password, salt) {
+        const enc = new TextEncoder();
+        const data = enc.encode(salt + '::' + password);
+        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
 
     async function loadLoginCreds() {
         try {
@@ -1024,7 +1174,9 @@
             errEl.style.display = 'block';
             return;
         }
-        const newCreds = { username, password };
+        const salt = randomSalt();
+        const passwordHash = await hashPassword(password, salt);
+        const newCreds = { username, passwordHash, salt };
         const ok = await saveWithRetry('stock_login', JSON.stringify(newCreds));
         if (!ok) {
             errEl.textContent = "Couldn't save your login right now — please try again.";
@@ -1035,11 +1187,19 @@
         afterLoginSuccess(username);
     };
 
-    window.attemptLogin = function () {
+    window.attemptLogin = async function () {
         const passEl = document.getElementById('loginPass');
         const errEl = document.getElementById('loginError');
         const entered = passEl.value || '';
-        if (!loginCreds || entered !== loginCreds.password) {
+        if (!loginCreds) {
+            errEl.textContent = 'Incorrect password. Please try again.';
+            errEl.style.display = 'block';
+            passEl.value = '';
+            passEl.focus();
+            return;
+        }
+        const enteredHash = await hashPassword(entered, loginCreds.salt);
+        if (enteredHash !== loginCreds.passwordHash) {
             errEl.textContent = 'Incorrect password. Please try again.';
             errEl.style.display = 'block';
             passEl.value = '';
@@ -1084,6 +1244,42 @@
         renderLoginForm();
     }
 
+    window.openChangePasswordModal = function () {
+        document.getElementById('cpCurrent').value = '';
+        document.getElementById('cpNew').value = '';
+        document.getElementById('cpConfirm').value = '';
+        document.getElementById('cpError').style.display = 'none';
+        document.getElementById('changePasswordModal').classList.add('show');
+        setTimeout(() => document.getElementById('cpCurrent').focus(), 0);
+    };
+
+    window.closeChangePasswordModal = function () {
+        document.getElementById('changePasswordModal').classList.remove('show');
+    };
+
+    window.submitChangePassword = async function () {
+        const curEl = document.getElementById('cpCurrent');
+        const newEl = document.getElementById('cpNew');
+        const confirmEl = document.getElementById('cpConfirm');
+        const errEl = document.getElementById('cpError');
+        const showErr = (msg) => { errEl.textContent = msg; errEl.style.display = 'block'; };
+
+        if (!loginCreds) { showErr('No login is currently set up.'); return; }
+        const curHash = await hashPassword(curEl.value || '', loginCreds.salt);
+        if (curHash !== loginCreds.passwordHash) { showErr('Current password is incorrect.'); return; }
+        if (!newEl.value) { showErr('Please enter a new password.'); return; }
+        if (newEl.value !== confirmEl.value) { showErr('New passwords do not match.'); return; }
+
+        const newSalt = randomSalt();
+        const newHash = await hashPassword(newEl.value, newSalt);
+        const newCreds = { username: loginCreds.username, passwordHash: newHash, salt: newSalt };
+        const ok = await saveWithRetry('stock_login', JSON.stringify(newCreds));
+        if (!ok) { showErr("Couldn't save the new password right now — please try again."); return; }
+        loginCreds = newCreds;
+        document.getElementById('changePasswordModal').classList.remove('show');
+        flashStatus('PASSWORD UPDATED');
+    };
+
     window.enterSystem = function () {
         const welcome = document.getElementById('welcomeScreen');
         const app = document.getElementById('app');
@@ -1105,6 +1301,10 @@
             loginCreds = null;
             renderLoginForm();
         });
+
+        // Team Mode preference next — must resolve before loading rows/meta/history,
+        // since it decides which storage pool (personal or shared) those reads use.
+        await initTeamMode().catch(e => console.warn('Team Mode init failed (non-critical, defaults to off)', e));
 
         // Load the stock rows next — this is the data that matters most,
         // and it renders the table (or the retry banner) as soon as it resolves.
