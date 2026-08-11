@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="stylesheet"
         href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
-    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="styles.css">
 </head>
 
 <body>
@@ -41,10 +41,17 @@
             </div>
             <div class="header-right">
                 <span class="nav-user" id="navUser"></span>
+                <button class="dark-toggle" onclick="openChangePasswordModal()">🔑 Change Password</button>
+                <button class="dark-toggle" id="teamModeToggleBtn" onclick="toggleTeamMode()">🌐 Team Mode: Off</button>
                 <button class="dark-toggle" id="darkToggle" onclick="toggleDarkMode()">🌙 Dark</button>
                 <button class="dark-toggle" onclick="doLogout()">Logout</button>
                 <div class="date-stamp" id="statusStamp">RECORDS CURRENT</div>
             </div>
+        </div>
+
+        <div id="teamModeBanner" class="team-mode-banner" style="display:none;">
+            🌐 <strong>Team Mode is on</strong> — this table is shared with anyone else who turns Team Mode on for this
+            file.
         </div>
 
         <div class="tab-bar">
@@ -71,6 +78,7 @@
                 <input type="text" id="searchBox" placeholder="Search by brand…" oninput="render()">
                 <button class="btn ghost" onclick="openPOModal()">📋 Purchase Order</button>
                 <button class="btn ghost" onclick="openPastDayModal()">🕘 View Past Day</button>
+                <button class="btn ghost" onclick="openSyncModal()">🔗 Sync via Code</button>
                 <button class="btn ghost" onclick="printLedger()">🖨 Print Ledger</button>
                 <button class="btn ghost" onclick="exportCSV()">📊 Export CSV</button>
                 <button class="btn ghost" onclick="saveBackup()">💾 Save Backup</button>
@@ -201,6 +209,69 @@
             <div class="modal-actions">
                 <button class="btn ghost" onclick="cancelRestore()">Cancel</button>
                 <button class="btn" onclick="confirmRestore()">Yes, Restore Backup</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Change Password Modal -->
+    <div class="modal-overlay no-print" id="changePasswordModal">
+        <div class="modal-box" style="max-width:420px;">
+            <div class="modal-title">🔑 Change Password</div>
+            <div class="modal-sub">Still a soft access screen, not real security — but this lets you rotate your
+                password without resetting the whole login.</div>
+            <div class="login-form" style="text-align:left;padding:0;">
+                <label class="login-label" for="cpCurrent">Current password</label>
+                <input class="login-input" type="password" id="cpCurrent" autocomplete="current-password"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('cpNew').focus();}">
+                <label class="login-label" for="cpNew">New password</label>
+                <input class="login-input" type="password" id="cpNew" autocomplete="new-password"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('cpConfirm').focus();}">
+                <label class="login-label" for="cpConfirm">Confirm new password</label>
+                <input class="login-input" type="password" id="cpConfirm" autocomplete="new-password"
+                    onkeydown="if(event.key==='Enter'){event.preventDefault();submitChangePassword();}">
+                <div id="cpError" class="login-error" style="display:none;"></div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closeChangePasswordModal()">Cancel</button>
+                <button class="btn" onclick="submitChangePassword()">Update Password</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sync via Code Modal -->
+    <div class="modal-overlay no-print" id="syncModal">
+        <div class="modal-box" style="max-width:520px;">
+            <div class="modal-title">🔗 Sync via Code</div>
+            <div class="modal-sub">
+                A quick way to move today's table to another device without downloading a file. This carries the table,
+                brand list, and bartender/date — not your sales history or day archives (use Save Backup for a full
+                copy).
+            </div>
+            <button class="btn" onclick="copySyncCode()">📋 Copy This Table as a Code</button>
+            <textarea id="syncCodeOutput" class="cell-input" readonly
+                style="display:none;width:100%;height:70px;font-size:10.5px;margin-top:10px;"
+                onclick="this.select()"></textarea>
+            <div style="margin-top:18px;">
+                <label class="login-label" for="pasteSyncInput">Paste a code from another device</label>
+                <textarea id="pasteSyncInput" class="cell-input"
+                    style="width:100%;height:70px;font-size:10.5px;"></textarea>
+                <button class="btn ghost" style="margin-top:8px;" onclick="loadSyncCode()">Load Code</button>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closeSyncModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sync Restore Confirmation Modal -->
+    <div class="modal-overlay no-print" id="syncConfirmModal">
+        <div class="modal-box" style="max-width:460px;">
+            <div class="modal-title">⚠️ Replace Current Table?</div>
+            <div class="modal-sub">This replaces your current table and bartender/date with the data from that code.
+                Your sales history and day archives are not affected.</div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="cancelSyncRestore()">Cancel</button>
+                <button class="btn" onclick="confirmSyncRestore()">Yes, Load This Data</button>
             </div>
         </div>
     </div>
