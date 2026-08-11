@@ -115,6 +115,21 @@
     color: var(--cream-white);
 }
 
+.team-mode-banner {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #2E5D8A;
+    color: #F4F5EF;
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 12.5px;
+    padding: 9px 24px;
+}
+
+.team-mode-banner strong {
+    font-weight: 700;
+}
+
 .tab-bar {
     display: flex;
     gap: 2px;
