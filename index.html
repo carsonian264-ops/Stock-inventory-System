@@ -8,7 +8,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="stylesheet"
         href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@500;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
-    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
@@ -50,8 +50,8 @@
         </div>
 
         <div id="teamModeBanner" class="team-mode-banner" style="display:none;">
-            🌐 <strong>Team Mode is on</strong> — this table is shared with anyone else who turns Team Mode on for this
-            file.
+            🌐 <strong>Team Mode is on</strong> — you're viewing this device's separate Team table, not your personal
+            one. This is local to this browser; use Sync via Code or Save/Load Backup to move data elsewhere.
         </div>
 
         <div class="tab-bar">
@@ -79,6 +79,7 @@
                 <button class="btn ghost" onclick="openPOModal()">📋 Purchase Order</button>
                 <button class="btn ghost" onclick="openPastDayModal()">🕘 View Past Day</button>
                 <button class="btn ghost" onclick="openSyncModal()">🔗 Sync via Code</button>
+                <button class="btn ghost" onclick="openFixedGate()">⚙ Fixed</button>
                 <button class="btn ghost" onclick="printLedger()">🖨 Print Ledger</button>
                 <button class="btn ghost" onclick="exportCSV()">📊 Export CSV</button>
                 <button class="btn ghost" onclick="saveBackup()">💾 Save Backup</button>
@@ -101,7 +102,6 @@
                     </div>
                 </div>
                 <div class="below-table">
-                    <button class="btn ghost" onclick="addRow()">+ Add Row</button>
                     <span id="rowCountLabel"
                         style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:var(--ink-soft);"></span>
                 </div>
@@ -272,6 +272,50 @@
             <div class="modal-actions">
                 <button class="btn ghost" onclick="cancelSyncRestore()">Cancel</button>
                 <button class="btn" onclick="confirmSyncRestore()">Yes, Load This Data</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fixed Section: Password Gate -->
+    <div class="modal-overlay no-print" id="fixedGateModal">
+        <div class="modal-box" style="max-width:400px;">
+            <div class="modal-title">🔒 Fixed Section</div>
+            <div class="modal-sub">This controls the Brand and Price columns for the whole ledger — enter your
+                password to continue.</div>
+            <div class="login-form" style="text-align:left;padding:0;">
+                <label class="login-label" for="fixedGatePass">Password</label>
+                <div class="pwd-field">
+                    <input class="login-input" type="password" id="fixedGatePass" autocomplete="current-password"
+                        oninput="clearFixedGateError()"
+                        onkeydown="if(event.key==='Enter'){event.preventDefault();submitFixedGate();}">
+                    <button type="button" class="pwd-toggle-btn" id="pwdToggle_fixedGatePass" aria-label="Show password" aria-pressed="false" onclick="togglePwdVisibility('fixedGatePass')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg></button>
+                </div>
+                <div id="fixedGateError" class="login-error" style="display:none;"></div>
+            </div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closeFixedGate()">Cancel</button>
+                <button class="btn" id="fixedGateSubmitBtn" onclick="submitFixedGate()">Continue</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Fixed Section: Brand & Price Master Config -->
+    <div class="modal-overlay no-print" id="fixedModal">
+        <div class="modal-box" style="max-width:840px;">
+            <div class="modal-title">⚙ Fixed — Brand &amp; Price Configuration</div>
+            <div class="modal-sub">
+                This is the master list of brands and prices for the main Stock Ledger. Brand order here sets the
+                order in the ledger, and prices here are used for the ledger's Totals. Existing stock numbers
+                (Opening/New/Sales) for brands you keep are preserved when you save.
+            </div>
+            <div class="table-scroll" style="max-height:360px;overflow:auto;">
+                <div id="fixedTableHost"></div>
+            </div>
+            <button class="btn ghost" style="margin-top:10px;" onclick="addFixedColumn()">+ Add Column</button>
+            <div id="fixedSaveMsg" class="fixed-save-msg" style="display:none;"></div>
+            <div class="modal-actions">
+                <button class="btn ghost" onclick="closeFixedModal()">Close</button>
+                <button class="btn" onclick="saveFixedConfig()">💾 Save</button>
             </div>
         </div>
     </div>
