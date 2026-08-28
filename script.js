@@ -1,15 +1,82 @@
 (function () {
+    // ---------- LOCAL STORAGE ADAPTER ----------
+    // This app is written against a small key/value storage interface
+    // (window.storage.get/set/delete/list, each returning a Promise) rather than
+    // calling localStorage directly everywhere. That keeps every read/write in one
+    // place, makes "shared" vs "personal" data an explicit parameter instead of a
+    // scattered convention, and matches the shape a real backend would have if one
+    // were ever added later.
+    //
+    // On a real device with only one browser, "shared" (Team Mode) storage is NOT
+    // actually shared with anyone else — there is no server here. It's a second,
+    // separate local data pool on THIS device, used so Team Mode can be a genuine,
+    // honest feature (a second table you can flip between) without pretending to
+    // sync across people or devices. Real cross-device sharing is what Sync via
+    // Code and Save/Load Backup are for.
+    const STORAGE_PREFIX = 'stockLedger::v1::';
+    function storageKey(key, shared) {
+        return STORAGE_PREFIX + (shared ? 'team::' : 'me::') + key;
+    }
+    window.storage = {
+        get(key, shared = false) {
+            return new Promise((resolve, reject) => {
+                try {
+                    const raw = localStorage.getItem(storageKey(key, shared));
+                    if (raw === null) {
+                        reject(new Error('Key not found: ' + key));
+                        return;
+                    }
+                    resolve({ key, value: raw, shared });
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        },
+        set(key, value, shared = false) {
+            return new Promise((resolve, reject) => {
+                try {
+                    localStorage.setItem(storageKey(key, shared), value);
+                    resolve({ key, value, shared });
+                } catch (e) {
+                    // Most commonly a quota-exceeded error. Surfaced to the caller so the
+                    // app's existing "save failed" banners/retry logic handle it honestly
+                    // instead of silently losing data.
+                    reject(e);
+                }
+            });
+        },
+        delete(key, shared = false) {
+            return new Promise((resolve) => {
+                localStorage.removeItem(storageKey(key, shared));
+                resolve({ key, deleted: true, shared });
+            });
+        },
+        list(prefix = '', shared = false) {
+            return new Promise((resolve) => {
+                const base = STORAGE_PREFIX + (shared ? 'team::' : 'me::');
+                const keys = [];
+                for (let i = 0; i < localStorage.length; i++) {
+                    const k = localStorage.key(i);
+                    if (k && k.startsWith(base + prefix)) keys.push(k.slice(base.length));
+                }
+                resolve({ keys, prefix, shared });
+            });
+        }
+    };
+
     let rows = [];
     let loaded = false;
     let currentTab = 'ledger';
     let pendingRestoreData = null;
-    const ROW_COUNT_DEFAULT = 15;
 
     const todayLabel = () => new Date().toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'short', day: 'numeric' });
     document.getElementById('dateLabel').textContent = todayLabel();
 
+    const EYE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>`;
+    const EYE_OFF_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a17.6 17.6 0 0 1-3.06 3.94M6.6 6.6C3.7 8.4 1 12 1 12s4 7 11 7a10.1 10.1 0 0 0 5.4-1.6M1 1l22 22"/><path d="M14.12 14.12A3 3 0 1 1 9.88 9.88"/></svg>`;
+
     function uid() { return 'r_' + Math.random().toString(36).slice(2, 10); }
-    function blankRow() { return { id: uid(), brand: '', opening: 0, newStock: 0, sales: 0, price: 0 }; }
+    function blankRow() { return { id: uid(), brand: '', opening: 0, newStock: 0, sales: 0, price: 0, fixedManaged: false }; }
     function money(n) { return (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 }); }
     function escapeHtml(s) {
         return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -115,7 +182,7 @@
             const res = await loadWithRetry('stock_rows', teamMode);
             rows = res ? JSON.parse(res.value) : null;
             if (rows === null) {
-                rows = Array.from({ length: ROW_COUNT_DEFAULT }, blankRow);
+                rows = [];
             }
             storageOK = true;
         } catch (e) {
@@ -137,11 +204,250 @@
         flashStatus(ok ? ('SAVED ' + new Date().toLocaleTimeString()) : 'SAVE FAILED — SEE BANNER', !ok);
     }
 
+    // ---------- FIXED SECTION (Brand & Price master config) ----------
+    // The Fixed section is the administrator's master list of brands and prices.
+    // It is NOT a separate table — it's the source of truth that the main ledger's
+    // Brand and Price columns are kept in sync with. Saving Fixed rewrites the
+    // ledger's brand order/prices for the brands it lists, while carefully
+    // preserving today's Opening/New/Sales numbers for any brand that still exists,
+    // and never silently destroying activity on a brand that gets removed.
+    let fixedConfig = []; // [{ brand, price }], one entry per column, left-to-right order preserved
+
+    async function loadFixedConfig() {
+        try {
+            const res = await loadWithRetry('stock_fixed', teamMode);
+            const parsed = res ? JSON.parse(res.value) : null;
+            fixedConfig = Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            console.warn('Fixed config load failed — starting from an empty configuration', e);
+            fixedConfig = [];
+        }
+    }
+
+    window.openFixedGate = function () {
+        const passEl = document.getElementById('fixedGatePass');
+        const errEl = document.getElementById('fixedGateError');
+        if (passEl) passEl.value = '';
+        if (errEl) errEl.style.display = 'none';
+        document.getElementById('fixedGateModal').classList.add('show');
+        setTimeout(() => { if (passEl) passEl.focus(); }, 0);
+    };
+
+    window.closeFixedGate = function () {
+        document.getElementById('fixedGateModal').classList.remove('show');
+    };
+
+    window.clearFixedGateError = function () {
+        const errEl = document.getElementById('fixedGateError');
+        if (errEl) errEl.style.display = 'none';
+    };
+
+    window.submitFixedGate = async function () {
+        const passEl = document.getElementById('fixedGatePass');
+        const errEl = document.getElementById('fixedGateError');
+        const btn = document.getElementById('fixedGateSubmitBtn');
+        const entered = passEl.value || '';
+        if (!entered) {
+            errEl.textContent = 'Please enter your password.';
+            errEl.style.display = 'block';
+            passEl.focus();
+            return;
+        }
+        if (!loginCreds) {
+            errEl.textContent = 'No login is set up on this device yet.';
+            errEl.style.display = 'block';
+            return;
+        }
+        btn.disabled = true;
+        try {
+            const hash = await hashPassword(entered, loginCreds.salt);
+            if (hash !== loginCreds.passwordHash) {
+                errEl.textContent = 'Incorrect password. Please try again.';
+                errEl.style.display = 'block';
+                passEl.value = '';
+                passEl.focus();
+                return;
+            }
+            closeFixedGate();
+            await openFixedEditor();
+        } catch (e) {
+            console.error('Fixed gate check failed', e);
+            errEl.textContent = 'Something went wrong checking your password — please try again.';
+            errEl.style.display = 'block';
+        } finally {
+            btn.disabled = false;
+        }
+    };
+
+    window.openFixedEditor = async function () {
+        await loadFixedConfig();
+        if (!fixedConfig || fixedConfig.length === 0) {
+            fixedConfig = Array.from({ length: 4 }, () => ({ brand: '', price: '' }));
+        }
+        renderFixedEditor();
+        const msg = document.getElementById('fixedSaveMsg');
+        if (msg) msg.style.display = 'none';
+        document.getElementById('fixedModal').classList.add('show');
+    };
+
+    window.closeFixedModal = function () {
+        document.getElementById('fixedModal').classList.remove('show');
+    };
+
+    function renderFixedEditor() {
+        const host = document.getElementById('fixedTableHost');
+        if (!host) return;
+        const brandCells = fixedConfig.map((c, i) => `
+        <td>
+          <input class="cell-input fixed-input" type="text" placeholder="Brand ${i + 1}" value="${escapeHtml(c.brand || '')}" data-col="${i}" data-field="brand" onchange="updateFixedCell(this)">
+          <button type="button" class="fixed-col-remove" title="Remove this column" onclick="removeFixedColumn(${i})">✕ remove</button>
+        </td>
+      `).join('');
+        const priceCells = fixedConfig.map((c, i) => `
+        <td><input class="cell-input fixed-input" type="number" min="0" step="0.01" placeholder="0" value="${c.price === '' || c.price == null ? '' : c.price}" data-col="${i}" data-field="price" onchange="updateFixedCell(this)"></td>
+      `).join('');
+        host.innerHTML = `
+        <table class="fixed-table">
+          <tbody>
+            <tr><th>Brand</th>${brandCells}</tr>
+            <tr><th>Prices</th>${priceCells}</tr>
+          </tbody>
+        </table>
+      `;
+    }
+
+    window.updateFixedCell = function (input) {
+        const col = Number(input.dataset.col);
+        const field = input.dataset.field;
+        if (!fixedConfig[col]) return;
+        if (field === 'brand') {
+            fixedConfig[col].brand = input.value;
+        } else {
+            fixedConfig[col].price = input.value === '' ? '' : Math.max(0, Number(input.value) || 0);
+        }
+    };
+
+    window.addFixedColumn = function () {
+        fixedConfig.push({ brand: '', price: '' });
+        renderFixedEditor();
+        // Focus the newly added brand cell so the administrator can start typing immediately.
+        const inputs = document.querySelectorAll('#fixedTableHost input[data-field="brand"]');
+        const last = inputs[inputs.length - 1];
+        if (last) last.focus();
+    };
+
+    window.removeFixedColumn = function (index) {
+        const entry = fixedConfig[index];
+        const label = entry && entry.brand ? `"${entry.brand}"` : 'this empty column';
+        if (fixedConfig.length > 1 && !confirm(`Remove ${label} from the Fixed list? This only takes effect once you click Save.`)) return;
+        fixedConfig.splice(index, 1);
+        renderFixedEditor();
+    };
+
+    function showFixedSaveMsg(text, isError) {
+        const msg = document.getElementById('fixedSaveMsg');
+        if (!msg) return;
+        msg.textContent = text;
+        msg.classList.toggle('error', !!isError);
+        msg.style.display = 'block';
+    }
+
+    window.saveFixedConfig = async function () {
+        // 1. Read + trim brand names, skipping fully blank columns.
+        const cleaned = fixedConfig
+            .map(c => ({ brand: (c.brand || '').trim(), price: c.price === '' || c.price == null ? 0 : Math.max(0, Number(c.price) || 0) }))
+            .filter(c => c.brand !== '');
+
+        // 2. Reject duplicate brand names (case-insensitive) rather than silently merging them.
+        const seen = new Set();
+        for (const c of cleaned) {
+            const key = c.brand.toLowerCase();
+            if (seen.has(key)) {
+                showFixedSaveMsg(`Duplicate brand "${c.brand}" — please use each brand name only once.`, true);
+                return;
+            }
+            seen.add(key);
+        }
+
+        // 3. Brand and Price are read-only in the Main Ledger, so removing a brand from
+        // this list takes it out of the active ledger entirely — not just unlocks it.
+        // Previously closed/archived days (Reports, "View Past Day") are untouched by
+        // this either way, since those are separate saved snapshots. What's at risk is
+        // only *today's* not-yet-closed numbers for a brand being dropped, so warn and
+        // require explicit confirmation before proceeding if any exist.
+        const cleanedKeys = new Set(cleaned.map(c => c.brand.toLowerCase()));
+        const aboutToLoseActivity = rows.filter(r => {
+            const key = (r.brand || '').trim().toLowerCase();
+            if (!key || cleanedKeys.has(key)) return false;
+            return Number(r.opening) > 0 || Number(r.newStock) > 0 || Number(r.sales) > 0;
+        });
+        if (aboutToLoseActivity.length > 0) {
+            const list = aboutToLoseActivity.map(r => `"${r.brand}"`).join(', ');
+            const proceed = confirm(
+                `${list} ${aboutToLoseActivity.length === 1 ? 'is' : 'are'} no longer in this Fixed list and ` +
+                `${aboutToLoseActivity.length === 1 ? 'has' : 'have'} unsaved stock entered today (Opening/New/Sales). ` +
+                `Removing them here also removes them from today's active Main Ledger — that stock entry won't be ` +
+                `recoverable unless today has already been closed for them.\n\nThis does NOT affect any previously ` +
+                `closed day or Reports history.\n\nRemove them anyway?`
+            );
+            if (!proceed) return;
+        }
+
+        // 4. Persist the full column set (including any blank columns left as placeholders)
+        // so the administrator sees the same layout next time they open Fixed.
+        const ok = await saveWithRetry('stock_fixed', JSON.stringify(fixedConfig), teamMode);
+        if (!ok) {
+            showFixedSaveMsg("Couldn't save the Fixed configuration right now — please try again.", true);
+            return;
+        }
+
+        // 5. Sync the cleaned, ordered brand/price list into the main ledger.
+        syncFixedToLedger(cleaned);
+        await saveRows();
+        render();
+
+        showFixedSaveMsg('Fixed data saved successfully. Main Ledger updated.', false);
+        flashStatus('FIXED CONFIG SAVED — LEDGER UPDATED');
+    };
+
+    function syncFixedToLedger(list) {
+        // list: [{brand, price}] — trimmed, de-duplicated, in the exact order the
+        // administrator entered them. This becomes the new brand order in the ledger.
+        // Every active-ledger row corresponds to exactly one Fixed entry; there is no
+        // other way for a row to exist here.
+        const existingByKey = new Map();
+        rows.forEach(r => {
+            const key = (r.brand || '').trim().toLowerCase();
+            if (key && !existingByKey.has(key)) existingByKey.set(key, r);
+        });
+
+        rows = list.map(entry => {
+            const key = entry.brand.toLowerCase();
+            const existing = existingByKey.get(key);
+            if (existing) {
+                // Keep existing Opening/New/Sales stock — only brand spelling and price come from Fixed.
+                existing.brand = entry.brand;
+                existing.price = entry.price;
+                existing.fixedManaged = true;
+                return existing;
+            }
+            const fresh = blankRow();
+            fresh.brand = entry.brand;
+            fresh.price = entry.price;
+            fresh.fixedManaged = true;
+            return fresh;
+        });
+        // Any row whose brand isn't in `list` is a brand that was removed from Fixed —
+        // it's simply not carried into the new `rows`, so it drops out of the active
+        // Main Ledger. Already-closed days keep their own separate archived copy
+        // (Reports / View Past Day), which this never touches.
+    }
+
     function updateSaveBanner() {
         const el = document.getElementById('saveWarning');
         if (!el) return;
         if (failedSaveKeys.size > 0) {
-            const labels = { stock_rows: 'the ledger table', stock_meta: 'the bartender name / date', stock_daily_tables: 'the day-close archive', stock_history: 'the sales history' };
+            const labels = { stock_rows: 'the ledger table', stock_meta: 'the bartender name / date', stock_daily_tables: 'the day-close archive', stock_history: 'the sales history', stock_fixed: 'the Fixed brand/price configuration' };
             const what = [...failedSaveKeys].map(k => labels[k] || k).join(', ');
             el.style.display = 'block';
             el.innerHTML = `
@@ -246,13 +552,16 @@
     };
 
     // ---------- TEAM MODE ----------
-    // Personal data (shared:false, the default everywhere else in this app) is only
-    // ever visible to the account that saved it — which is exactly why two people, or
-    // one person on two devices, never see the same table by default. Team Mode is an
-    // explicit, opt-in switch to shared:true storage instead: a single table visible
-    // and editable by anyone who also has Team Mode on for this same file. It's off by
-    // default and never turns on without a clear confirmation, since it's a real change
-    // in who can see your data, not just a display setting.
+    // This is a browser-only app with no backend, so there's no way for it to truly
+    // sync data between different people or different devices in real time. Team Mode
+    // is a deliberately honest, local-only feature instead: it points all reads/writes
+    // at a second storage pool (shared:true) on THIS device, separate from your
+    // personal one (shared:false). That's genuinely useful for e.g. a shared till
+    // computer where you want one "Team" table kept apart from personal scratch data —
+    // it is NOT a substitute for real cross-device sharing. For that, use Sync via
+    // Code or Save/Load Backup, which work identically regardless of Team Mode.
+    // It's off by default and never turns on without a clear confirmation explaining
+    // exactly what it does, since it changes which data you're looking at.
     async function initTeamMode() {
         try {
             const res = await window.storage.get('ui_team_mode');
@@ -279,15 +588,17 @@
 
     window.toggleTeamMode = async function () {
         if (teamMode) {
-            if (!confirm('Turn off Team Mode? You will go back to viewing only your own private table — the shared table stays exactly as it is for anyone still using it.')) return;
+            if (!confirm('Turn off Team Mode? You will go back to your personal table — the Team table stays exactly as it is, ready for next time.')) return;
             teamMode = false;
         } else {
             const proceed = confirm(
-                "Turn on Team Mode?\n\nYour view will switch to a SHARED table — visible and editable by anyone else who " +
-                "also turns Team Mode on for this same file. Your current personal table is not deleted or merged; it's " +
-                "just set aside, and you can turn Team Mode off anytime to go back to it exactly as you left it.\n\n" +
-                "Want to bring your current table INTO the shared one instead of starting fresh? Turn on Team Mode, then " +
-                "use Load Backup or Sync via Code to bring your data in."
+                "Turn on Team Mode?\n\nThis app runs entirely in your browser, so there's no server tying multiple " +
+                "people or devices together automatically. What Team Mode actually does: it switches this browser to a " +
+                "SECOND, separate local table (\"Team\") instead of your personal one — useful for keeping a shared " +
+                "shift/bar table apart from a personal scratch table on a shared computer. Your personal table is not " +
+                "deleted or merged; it's just set aside, and turning Team Mode off returns you to it exactly as you left it.\n\n" +
+                "To actually move this table to another device or person, use Sync via Code or Save Backup / Load Backup " +
+                "— those work the same whether Team Mode is on or off."
             );
             if (!proceed) return;
             teamMode = true;
@@ -295,7 +606,7 @@
         try { await window.storage.set('ui_team_mode', JSON.stringify(teamMode)); } catch (e) { /* non-critical: this is just a personal display preference */ }
         updateTeamModeUI();
         await reloadForModeSwitch();
-        flashStatus(teamMode ? 'TEAM MODE ON — VIEWING SHARED TABLE' : 'TEAM MODE OFF — VIEWING YOUR TABLE');
+        flashStatus(teamMode ? 'TEAM MODE ON — VIEWING TEAM TABLE' : 'TEAM MODE OFF — VIEWING YOUR TABLE');
     };
 
     // ---------- TABS ----------
@@ -354,20 +665,28 @@
 
         renderSummary();
 
+        document.getElementById('rowCountLabel').textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} total`;
+
+        const host = document.getElementById('tableHost');
+        if (rows.length === 0) {
+            host.innerHTML = `<div style="padding:40px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">
+          No brands configured yet.<br><br>
+          Open <strong>⚙ Fixed</strong> above and add your brand list and prices — the Main Ledger fills in
+          automatically once you save.
+        </div>`;
+            return;
+        }
+
         const q = (document.getElementById('searchBox').value || '').toLowerCase().trim();
         const numbered = rows.map((r, i) => ({ r, no: i + 1 }));
         const filtered = q ? numbered.filter(x => (x.r.brand || '').toLowerCase().includes(q)) : numbered;
 
-        document.getElementById('rowCountLabel').textContent = `${rows.length} row${rows.length === 1 ? '' : 's'} total`;
-
-        const host = document.getElementById('tableHost');
         if (filtered.length === 0) {
             host.innerHTML = `<div style="padding:30px;text-align:center;font-family:'IBM Plex Mono',monospace;font-size:12px;color:var(--ink-soft);">No brands match "${q}".</div>`;
             return;
         }
 
         const closeIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3.5-7.1"/><path d="M21 3v6h-6"/></svg>`;
-        const trashIcon = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>`;
 
         const bodyRows = filtered.map(({ r, no }) => {
             const total = totalOf(r);
@@ -379,10 +698,17 @@
                 ? `<span class="stamp out">Out of Stock</span>`
                 : `<span class="stamp ok">In Stock</span>`;
 
+            // Brand and Price are always read-only here — they're display-only values
+            // owned by the Fixed section. There is no input, no onchange handler, and
+            // no way to type into these cells; the only way to change a brand name or
+            // price is to open Fixed, edit it there, and save.
+            const brandCell = `<span class="fixed-cell" title="Brand is set in the Fixed section — edit it there">${escapeHtml(r.brand)}<span class="fixed-badge" aria-hidden="true">🔒</span></span>`;
+            const priceCell = `<span class="fixed-cell" title="Price is set in the Fixed section — edit it there">${money(r.price)}<span class="fixed-badge" aria-hidden="true">🔒</span></span>`;
+
             return `
           <tr data-id="${r.id}" class="${rowCls}">
             <td class="center no-cell" data-label="No.">${no}</td>
-            <td data-label="Brand"><input class="cell-input brand-input" type="text" placeholder="Brand name" value="${escapeHtml(r.brand)}" onchange="updateField('${r.id}','brand',this.value)"></td>
+            <td data-label="Brand">${brandCell}</td>
             <td class="num" data-label="Opening Stock"><input class="cell-input" type="number" min="0" value="${r.opening}" onchange="updateField('${r.id}','opening',this.value)"></td>
             <td class="num" data-label="New Stock"><input class="cell-input" type="number" min="0" value="${r.newStock}" onchange="updateField('${r.id}','newStock',this.value)"></td>
             <td class="num" data-label="Total Stock"><span class="computed-val">${total}</span></td>
@@ -395,13 +721,12 @@
                 <button class="icon-btn danger" title="Reset sales to 0" onclick="resetSales('${r.id}')">↺</button>
               </div>
             </td>
-            <td class="num" data-label="Price (Ksh)"><input class="cell-input" type="number" min="0" step="0.01" value="${r.price}" onchange="updateField('${r.id}','price',this.value)"></td>
+            <td class="num" data-label="Price (Ksh)">${priceCell}</td>
             <td class="num" data-label="Totals"><span class="computed-val">${money(totals)}</span><span class="computed-sub">Ksh</span></td>
             <td class="center" data-label="Status">${stamp}</td>
             <td class="center" data-label="Actions">
               <div class="row-actions">
                 <button class="icon-btn" title="Close day &amp; carry forward" onclick="closeDay('${r.id}')">${closeIcon}</button>
-                <button class="icon-btn danger" title="Remove row" onclick="removeRow('${r.id}')">${trashIcon}</button>
               </div>
             </td>
           </tr>
@@ -433,11 +758,13 @@
     window.updateField = function (id, field, value) {
         const r = rows.find(x => x.id === id);
         if (!r) return;
-        if (field === 'brand') {
-            r.brand = value;
-        } else {
-            r[field] = Math.max(0, Number(value) || 0);
+        if (field === 'brand' || field === 'price') {
+            // Brand and Price are controlled entirely by the Fixed section. There is no
+            // UI path that calls this with those fields, but the guard stays here as an
+            // explicit rule rather than relying on the absence of an input element.
+            return;
         }
+        r[field] = Math.max(0, Number(value) || 0);
         saveRows();
         render();
     };
@@ -472,24 +799,6 @@
         saveRows();
         render();
         flashStatus('SALES RESET — ' + (r.brand || 'row'));
-    };
-
-    window.addRow = function () {
-        rows.push(blankRow());
-        saveRows();
-        render();
-        flashStatus('ROW ADDED');
-    };
-
-    window.removeRow = function (id) {
-        const r = rows.find(x => x.id === id);
-        if (!r) return;
-        const label = r.brand && r.brand.trim() !== '' ? `"${r.brand}"` : 'this blank row';
-        if (!confirm(`Remove ${label} from the ledger? This can't be undone.`)) return;
-        rows = rows.filter(x => x.id !== id);
-        saveRows();
-        render();
-        flashStatus('ROW REMOVED');
     };
 
     window.closeDay = async function (id) {
@@ -642,7 +951,7 @@
 
     window.confirmFreshStart = function () {
         storageOK = true;
-        rows = Array.from({ length: ROW_COUNT_DEFAULT }, blankRow);
+        rows = [];
         render();
         flashStatus('STARTED FRESH — NOT YET SAVED');
     };
@@ -871,7 +1180,8 @@
             alert("Couldn't read your history right now, so a backup wasn't created — a backup missing your history would look complete but wouldn't be. Please try again in a moment.");
             return;
         }
-        const payload = { exportedAt: new Date().toISOString(), rows, history: hist };
+        await loadFixedConfig();
+        const payload = { exportedAt: new Date().toISOString(), rows, history: hist, fixedConfig };
         downloadBlob(JSON.stringify(payload, null, 2), 'application/json', 'stock_ledger_backup_' + new Date().toISOString().slice(0, 10) + '.json');
     };
 
@@ -909,15 +1219,22 @@
         if (!pendingRestoreData) return;
         rows = pendingRestoreData.rows;
         const hist = Array.isArray(pendingRestoreData.history) ? pendingRestoreData.history : [];
+        const restoredFixed = Array.isArray(pendingRestoreData.fixedConfig) ? pendingRestoreData.fixedConfig : null;
         const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows), teamMode);
         const histOk = await saveWithRetry('stock_history', JSON.stringify(hist), teamMode);
+        let fixedOk = true;
+        if (restoredFixed) {
+            fixedConfig = restoredFixed;
+            fixedOk = await saveWithRetry('stock_fixed', JSON.stringify(fixedConfig), teamMode);
+        }
         if (rowsOk) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
         if (histOk) { failedSaveKeys.delete('stock_history'); } else { failedSaveKeys.add('stock_history'); }
+        if (restoredFixed) { if (fixedOk) { failedSaveKeys.delete('stock_fixed'); } else { failedSaveKeys.add('stock_fixed'); } }
         updateSaveBanner();
         pendingRestoreData = null;
         document.getElementById('restoreConfirmModal').classList.remove('show');
         render();
-        if (rowsOk && histOk) {
+        if (rowsOk && histOk && fixedOk) {
             flashStatus('BACKUP RESTORED');
         } else {
             flashStatus('RESTORE INCOMPLETE — SEE BANNER', true);
@@ -942,7 +1259,8 @@
     };
 
     window.copySyncCode = async function () {
-        const payload = { rows, meta };
+        await loadFixedConfig();
+        const payload = { rows, meta, fixedConfig };
         const code = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
         const outputEl = document.getElementById('syncCodeOutput');
         outputEl.style.display = 'block';
@@ -994,17 +1312,24 @@
             if (nameEl) nameEl.value = meta.bartender;
             if (dateEl) dateEl.value = meta.date;
         }
+        const restoredFixed = Array.isArray(pendingSyncData.fixedConfig) ? pendingSyncData.fixedConfig : null;
         const rowsOk = await saveWithRetry('stock_rows', JSON.stringify(rows), teamMode);
         const metaOk = await saveWithRetry('stock_meta', JSON.stringify(meta), teamMode);
+        let fixedOk = true;
+        if (restoredFixed) {
+            fixedConfig = restoredFixed;
+            fixedOk = await saveWithRetry('stock_fixed', JSON.stringify(fixedConfig), teamMode);
+        }
         if (rowsOk) { failedSaveKeys.delete('stock_rows'); } else { failedSaveKeys.add('stock_rows'); }
         if (metaOk) { failedSaveKeys.delete('stock_meta'); } else { failedSaveKeys.add('stock_meta'); }
+        if (restoredFixed) { if (fixedOk) { failedSaveKeys.delete('stock_fixed'); } else { failedSaveKeys.add('stock_fixed'); } }
         updateSaveBanner();
         pendingSyncData = null;
         document.getElementById('syncConfirmModal').classList.remove('show');
         document.getElementById('syncModal').classList.remove('show');
         document.getElementById('pasteSyncInput').value = '';
         render();
-        flashStatus(rowsOk && metaOk ? 'SYNCED FROM CODE' : 'SYNC INCOMPLETE — SEE BANNER', !(rowsOk && metaOk));
+        flashStatus((rowsOk && metaOk && fixedOk) ? 'SYNCED FROM CODE' : 'SYNC INCOMPLETE — SEE BANNER', !(rowsOk && metaOk && fixedOk));
     };
 
     // ---------- REPORTS ----------
@@ -1104,16 +1429,41 @@
     let loginCreds = null;
 
     function randomSalt() {
-        const arr = new Uint8Array(16);
-        crypto.getRandomValues(arr);
-        return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+        if (window.crypto && crypto.getRandomValues) {
+            const arr = new Uint8Array(16);
+            crypto.getRandomValues(arr);
+            return Array.from(arr).map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+        // Fallback for the rare environment without the Web Crypto API. Still unique
+        // per install, just not cryptographically strong — fine for a soft access
+        // screen that was never meant to be real security anyway.
+        return Math.random().toString(36).slice(2) + Date.now().toString(36);
     }
 
     async function hashPassword(password, salt) {
-        const enc = new TextEncoder();
-        const data = enc.encode(salt + '::' + password);
-        const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+        const combined = salt + '::' + password;
+        if (window.crypto && crypto.subtle && crypto.subtle.digest) {
+            try {
+                const enc = new TextEncoder();
+                const data = enc.encode(combined);
+                const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+                return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+            } catch (e) {
+                console.warn('crypto.subtle.digest failed, falling back to a simple hash', e);
+            }
+        }
+        // Fallback (non-cryptographic) hash for contexts without Web Crypto — e.g. some
+        // very old or locked-down browsers opening this file directly. Weaker, but this
+        // login was always documented as a soft access screen, not real authentication.
+        let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+        for (let i = 0; i < combined.length; i++) {
+            const ch = combined.charCodeAt(i);
+            h1 = Math.imul(h1 ^ ch, 2654435761);
+            h2 = Math.imul(h2 ^ ch, 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        return (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0') + 'fallback';
     }
 
     async function loadLoginCreds() {
@@ -1128,6 +1478,84 @@
         renderLoginForm();
     }
 
+    // ---------- LOGIN UX HELPERS ----------
+    // Small, reusable helpers behind the friendlier login form: a show/hide toggle for
+    // password fields, a Caps Lock warning (a very common reason people get "locked
+    // out" of a password they typed correctly), and consistent error display/clearing.
+
+    function pwdFieldHTML(id, labelText, placeholder, autocomplete, enterAttr) {
+        return `
+        <label class="login-label" for="${id}">${labelText}</label>
+        <div class="pwd-field">
+          <input class="login-input" type="password" id="${id}" placeholder="${placeholder}" autocomplete="${autocomplete}"
+            oninput="clearLoginError(this)"
+            onkeyup="watchCapsLock(event,'${id}')"
+            onblur="hideCapsWarning('${id}')"
+            ${enterAttr}>
+          <button type="button" class="pwd-toggle-btn" id="pwdToggle_${id}" aria-label="Show password" aria-pressed="false" onclick="togglePwdVisibility('${id}')">${EYE_ICON}</button>
+        </div>
+        <div class="caps-warning" id="capsWarn_${id}" style="display:none;" role="status">⇪ Caps Lock is on</div>
+      `;
+    }
+
+    window.togglePwdVisibility = function (id) {
+        const input = document.getElementById(id);
+        const btn = document.getElementById('pwdToggle_' + id);
+        if (!input || !btn) return;
+        const nowShown = input.type === 'password';
+        input.type = nowShown ? 'text' : 'password';
+        btn.innerHTML = nowShown ? EYE_OFF_ICON : EYE_ICON;
+        btn.setAttribute('aria-label', nowShown ? 'Hide password' : 'Show password');
+        btn.setAttribute('aria-pressed', String(nowShown));
+        // Keep focus (and the cursor at the end) in the field rather than jumping to the button.
+        input.focus();
+        const len = input.value.length;
+        try { input.setSelectionRange(len, len); } catch (e) { /* not all input types support this */ }
+    };
+
+    window.watchCapsLock = function (event, id) {
+        const warn = document.getElementById('capsWarn_' + id);
+        if (!warn) return;
+        const isOn = typeof event.getModifierState === 'function' && event.getModifierState('CapsLock');
+        warn.style.display = isOn ? 'flex' : 'none';
+    };
+
+    window.hideCapsWarning = function (id) {
+        const warn = document.getElementById('capsWarn_' + id);
+        if (warn) warn.style.display = 'none';
+    };
+
+    window.clearLoginError = function (fromInput) {
+        const errEl = document.getElementById('loginError');
+        if (errEl && errEl.style.display !== 'none') {
+            errEl.style.display = 'none';
+            errEl.classList.remove('shake');
+        }
+        document.querySelectorAll('#loginFormArea .login-input.invalid').forEach(el => el.classList.remove('invalid'));
+    };
+
+    function showLoginFormError(msg, invalidIds) {
+        const errEl = document.getElementById('loginError');
+        if (!errEl) return;
+        errEl.innerHTML = `<span aria-hidden="true">⚠</span><span>${escapeHtml(msg)}</span>`;
+        errEl.style.display = 'flex';
+        errEl.setAttribute('role', 'alert');
+        errEl.classList.remove('shake');
+        void errEl.offsetWidth; // restart the animation if the same error fires twice in a row
+        errEl.classList.add('shake');
+        (invalidIds || []).forEach(id => {
+            const el = document.getElementById(id);
+            if (el) el.classList.add('invalid');
+        });
+    }
+
+    function setSubmitBusy(btn, busy, busyLabel, idleLabel) {
+        if (!btn) return;
+        btn.disabled = busy;
+        const arrow = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>`;
+        btn.innerHTML = busy ? busyLabel : `${idleLabel} ${arrow}`;
+    }
+
     function renderLoginForm() {
         const area = document.getElementById('loginFormArea');
         if (!area) return;
@@ -1135,24 +1563,30 @@
             area.innerHTML = `
           <div class="login-form">
             <label class="login-label" for="loginSetupUser">Choose a username</label>
-            <input class="login-input" type="text" id="loginSetupUser" placeholder="e.g. your name" autocomplete="off">
-            <label class="login-label" for="loginSetupPass">Choose a password</label>
-            <input class="login-input" type="password" id="loginSetupPass" placeholder="Anything you'll remember" autocomplete="new-password" onkeydown="if(event.key==='Enter'){event.preventDefault();createLogin();}">
-            <div id="loginError" class="login-error" style="display:none;"></div>
-            <button class="login-submit-btn" onclick="createLogin()">
+            <input class="login-input" type="text" id="loginSetupUser" placeholder="e.g. your name" autocomplete="off"
+              oninput="clearLoginError(this)"
+              onkeydown="if(event.key==='Enter'){event.preventDefault();document.getElementById('loginSetupPass').focus();}">
+            ${pwdFieldHTML('loginSetupPass', 'Choose a password', 'Anything you\u2019ll remember', 'new-password',
+                "onkeydown=\"if(event.key==='Enter'){event.preventDefault();document.getElementById('loginSetupPassConfirm').focus();}\"")}
+            <div class="login-hint">At least 4 characters — pick something you won't forget, since there's no email to reset it with.</div>
+            ${pwdFieldHTML('loginSetupPassConfirm', 'Confirm password', 'Type it again', 'new-password',
+                "onkeydown=\"if(event.key==='Enter'){event.preventDefault();createLogin();}\"")}
+            <div id="loginError" class="login-error" style="display:none;" aria-live="assertive"></div>
+            <button class="login-submit-btn" id="loginSubmitBtn" onclick="createLogin()">
               Create Login &amp; Enter
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </button>
           </div>
         `;
+            setTimeout(() => { const u = document.getElementById('loginSetupUser'); if (u) u.focus(); }, 0);
         } else {
             area.innerHTML = `
           <div class="login-form">
             <div class="welcome-returning">Welcome back, <strong>${escapeHtml(loginCreds.username)}</strong></div>
-            <label class="login-label" for="loginPass">Password</label>
-            <input class="login-input" type="password" id="loginPass" placeholder="Enter your password" autocomplete="current-password" onkeydown="if(event.key==='Enter'){event.preventDefault();attemptLogin();}">
-            <div id="loginError" class="login-error" style="display:none;"></div>
-            <button class="login-submit-btn" onclick="attemptLogin()">
+            ${pwdFieldHTML('loginPass', 'Password', 'Enter your password', 'current-password',
+                "onkeydown=\"if(event.key==='Enter'){event.preventDefault();attemptLogin();}\"")}
+            <div id="loginError" class="login-error" style="display:none;" aria-live="assertive"></div>
+            <button class="login-submit-btn" id="loginSubmitBtn" onclick="attemptLogin()">
               Sign In
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg>
             </button>
@@ -1166,47 +1600,82 @@
     window.createLogin = async function () {
         const userEl = document.getElementById('loginSetupUser');
         const passEl = document.getElementById('loginSetupPass');
-        const errEl = document.getElementById('loginError');
+        const confirmEl = document.getElementById('loginSetupPassConfirm');
+        const btn = document.getElementById('loginSubmitBtn');
         const username = (userEl.value || '').trim();
         const password = passEl.value || '';
-        if (!username || !password) {
-            errEl.textContent = 'Please choose both a username and a password.';
-            errEl.style.display = 'block';
+        const confirmPassword = confirmEl.value || '';
+
+        if (!username) {
+            showLoginFormError('Please choose a username.', ['loginSetupUser']);
+            userEl.focus();
             return;
         }
-        const salt = randomSalt();
-        const passwordHash = await hashPassword(password, salt);
-        const newCreds = { username, passwordHash, salt };
-        const ok = await saveWithRetry('stock_login', JSON.stringify(newCreds));
-        if (!ok) {
-            errEl.textContent = "Couldn't save your login right now — please try again.";
-            errEl.style.display = 'block';
+        if (password.length < 4) {
+            showLoginFormError('Please choose a password with at least 4 characters.', ['loginSetupPass']);
+            passEl.focus();
             return;
         }
-        loginCreds = newCreds;
-        afterLoginSuccess(username);
+        if (password !== confirmPassword) {
+            showLoginFormError("Those passwords don't match — please re-enter them.", ['loginSetupPass', 'loginSetupPassConfirm']);
+            confirmEl.value = '';
+            confirmEl.focus();
+            return;
+        }
+
+        setSubmitBusy(btn, true, 'Creating your login…', 'Create Login &amp; Enter');
+        try {
+            const salt = randomSalt();
+            const passwordHash = await hashPassword(password, salt);
+            const newCreds = { username, passwordHash, salt };
+            const ok = await saveWithRetry('stock_login', JSON.stringify(newCreds));
+            if (!ok) {
+                showLoginFormError("Couldn't save your login right now — please try again.", []);
+                setSubmitBusy(btn, false, '', 'Create Login &amp; Enter');
+                return;
+            }
+            loginCreds = newCreds;
+            afterLoginSuccess(username);
+        } catch (e) {
+            console.error('Login creation failed', e);
+            showLoginFormError('Something went wrong creating your login — please try again.', []);
+            setSubmitBusy(btn, false, '', 'Create Login &amp; Enter');
+        }
     };
 
     window.attemptLogin = async function () {
         const passEl = document.getElementById('loginPass');
-        const errEl = document.getElementById('loginError');
+        const btn = document.getElementById('loginSubmitBtn');
         const entered = passEl.value || '';
+
+        if (!entered) {
+            showLoginFormError('Please enter your password.', ['loginPass']);
+            passEl.focus();
+            return;
+        }
         if (!loginCreds) {
-            errEl.textContent = 'Incorrect password. Please try again.';
-            errEl.style.display = 'block';
+            showLoginFormError('Incorrect password. Please try again.', ['loginPass']);
             passEl.value = '';
             passEl.focus();
             return;
         }
-        const enteredHash = await hashPassword(entered, loginCreds.salt);
-        if (enteredHash !== loginCreds.passwordHash) {
-            errEl.textContent = 'Incorrect password. Please try again.';
-            errEl.style.display = 'block';
-            passEl.value = '';
-            passEl.focus();
-            return;
+
+        setSubmitBusy(btn, true, 'Signing in…', 'Sign In');
+        try {
+            const enteredHash = await hashPassword(entered, loginCreds.salt);
+            if (enteredHash !== loginCreds.passwordHash) {
+                showLoginFormError('Incorrect password. Please try again.', ['loginPass']);
+                passEl.value = '';
+                passEl.focus();
+                setSubmitBusy(btn, false, '', 'Sign In');
+                return;
+            }
+            afterLoginSuccess(loginCreds.username);
+        } catch (e) {
+            console.error('Login attempt failed', e);
+            showLoginFormError('Something went wrong signing in — please try again.', []);
+            setSubmitBusy(btn, false, '', 'Sign In');
         }
-        afterLoginSuccess(loginCreds.username);
     };
 
     function afterLoginSuccess(username) {
@@ -1290,11 +1759,6 @@
     window.render = render;
 
     async function initApp() {
-        // Give the storage bridge a brief moment to finish initializing before the
-        // very first call — calling immediately on mount is a plausible reason a
-        // fresh page load can see every single read fail at once.
-        await new Promise(r => setTimeout(r, 250));
-
         // Login form first — it's the very first thing the user sees.
         await loadLoginCreds().catch(function (e) {
             console.error('Login state load crashed unexpectedly', e);
@@ -1303,7 +1767,7 @@
         });
 
         // Team Mode preference next — must resolve before loading rows/meta/history,
-        // since it decides which storage pool (personal or shared) those reads use.
+        // since it decides which storage pool (personal or team) those reads use.
         await initTeamMode().catch(e => console.warn('Team Mode init failed (non-critical, defaults to off)', e));
 
         // Load the stock rows next — this is the data that matters most,
@@ -1319,12 +1783,7 @@
             }
         });
 
-        // Then the lower-stakes reads, staggered rather than fired at the same
-        // instant, so we're not bursting several concurrent requests at once.
-        await new Promise(r => setTimeout(r, 200));
         await loadMeta().catch(e => console.warn('Meta init failed (non-critical)', e));
-
-        await new Promise(r => setTimeout(r, 200));
         await initTheme().catch(e => console.warn('Theme init failed (non-critical)', e));
     }
 
